@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
     std::cerr << "Couldn't print timing information! STDOUT Closed!" << std::endl;
     exit(1);
   }
-
+  std::cerr << "numRows:" << numRows() << "numCols" << numCols() <<std::endl;
   size_t numPixels = numRows()*numCols();
   checkCudaErrors(cudaMemcpy(h_greyImage, d_greyImage, sizeof(unsigned char) * numPixels, cudaMemcpyDeviceToHost));
 
