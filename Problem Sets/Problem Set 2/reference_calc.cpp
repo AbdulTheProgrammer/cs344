@@ -29,7 +29,6 @@ void channelConvolution(const unsigned char* const channel,
           result += image_value * filter_value;
         }
       }
-
       channelBlurred[r * numCols + c] = result;
     }
   }
