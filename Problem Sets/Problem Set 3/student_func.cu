@@ -80,7 +80,88 @@
 */
 
 #include "utils.h"
+#include <stdint.h>
+#include <float.h>
 
+__device__ float dev_min(float a, float b) {
+	return (a > b) ? b : a;
+}
+__device__ float dev_max(float a, float b) {
+	return (a > b) ? a : b;
+}
+
+__global__
+void parallel_minmax(const float* const d_in, float * min_d_out, float * max_d_out, const size_t numCols, const size_t numRows) {
+
+	extern __shared__ float shared_array[];
+		
+	float *max_sdata = shared_array;
+	float *min_sdata = &(shared_array[blockDim.x]);
+
+	int myId = threadIdx.x + blockIdx.x * blockDim.x;
+	int tid = threadIdx.x;
+
+	//if (myId < numRows*numCols)
+	if(min_d_out)
+		min_sdata[tid] = d_in[myId];
+	if(max_d_out)
+		max_sdata[tid] = d_in[myId];
+	
+	__syncthreads();
+
+	for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+		if (tid < s) {
+			if(min_d_out)
+				min_sdata[tid] = dev_min(min_sdata[tid], min_sdata[tid + s]);
+			if(max_d_out)
+				max_sdata[tid] = dev_max(max_sdata[tid], max_sdata[tid + s]);
+		}
+		__syncthreads();
+	}
+	if (tid == 0) {
+		if(min_d_out)
+			min_d_out[blockIdx.x] = min_sdata[tid];
+		if(max_d_out)
+			max_d_out[blockIdx.x] = max_sdata[tid];
+	}
+}
+__global__
+void generate_histogram(const float* const d_logLuminance, int * d_histo, const int numOfBins, const float range, const float min) {
+	//extern __shared__ float shared_array[];
+	int id = threadIdx.x + blockDim.x * blockIdx.x; 
+	int bin = (d_logLuminance[id] - min) * (numOfBins) / range; 
+	atomicAdd(&(d_histo[bin]), 1);
+}
+__global__ 
+void copy(float * dst, const float * const src) {
+	dst[threadIdx.x] = src[threadIdx.x];
+}
+
+__global__
+void pad(float * dst, const int start, const float padding) {
+	dst[start + threadIdx.x] = padding;
+}
+
+bool IsPowerOfTwo(unsigned long x) {
+	return x != 0 && ((x & (x - 1)) == 0);
+}
+
+int nearestPowerOfTwo(unsigned long x) {
+	return static_cast<int> (pow(2,ceil(log(x)/log(2))));
+}
+
+float * resize_d_array(float * d_array, int old_num ,int new_num, float padding_num) {
+	if (old_num == new_num)
+		return d_array;
+	float * new_array; 
+	checkCudaErrors(cudaMalloc(&new_array, sizeof(float) * new_num));
+	copy <<<1, new_num >>>(new_array, d_array);
+	if (new_num > old_num) {
+		pad <<<1, new_num - old_num >>>(new_array, old_num - 1, padding_num);
+	}
+	checkCudaErrors(cudaFree(d_array));
+	return new_array;
+}
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
                                   float &min_logLum,
@@ -89,6 +170,55 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   const size_t numCols,
                                   const size_t numBins)
 {
+	// step 1: calculate max and min using the a parallel reduce strategy 
+	int thread_num = 1024;
+	int block_num = (numCols*numRows) / thread_num ;
+	//TODO handle the case if the dimensions of the picture are not divisible evenly by thread_num (add padding to d_logLum)
+	float * d_intermediate_min;
+	float * d_intermediate_max;
+	float * d_max;
+	float * d_min;
+	checkCudaErrors(cudaMalloc((void **) &d_intermediate_min, sizeof(float) * block_num ));
+	checkCudaErrors(cudaMalloc((void **) &d_intermediate_max, sizeof(float) * block_num));
+	checkCudaErrors(cudaMalloc((void **) &d_min, sizeof(float)));
+	checkCudaErrors(cudaMalloc((void **) &d_max, sizeof(float)));
+
+	parallel_minmax <<<block_num, thread_num, thread_num * sizeof(float) * 2 >>>(d_logLuminance, d_intermediate_min, d_intermediate_max, numCols, numRows);
+	if (!IsPowerOfTwo(block_num)) {
+		int temp = nearestPowerOfTwo(block_num);
+		printf("%i \n", temp);
+		d_intermediate_min = resize_d_array(d_intermediate_min,block_num,temp, FLT_MAX);
+		d_intermediate_max = resize_d_array(d_intermediate_max, block_num, temp, -FLT_MAX);
+		block_num = temp;
+	}
+	float *h_intermediate_max = new float[block_num];
+	checkCudaErrors(cudaMemcpy(h_intermediate_max, d_intermediate_max,sizeof(float) * block_num, cudaMemcpyDeviceToHost));
+	for (int i = 0; i < block_num; i++)
+		printf("this is the val %f %i \n", h_intermediate_max[i], block_num);
+	thread_num = block_num; 
+	block_num = 1;
+	parallel_minmax <<<block_num, thread_num, thread_num * sizeof(float) * 2 >>>(d_intermediate_min, d_min, NULL, numCols, numRows);
+	parallel_minmax <<<block_num, thread_num, thread_num * sizeof(float) * 2 >>>(d_intermediate_max, NULL,d_max, numCols, numRows);
+	
+	checkCudaErrors(cudaMemcpy(&min_logLum, d_min, sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&max_logLum, d_max, sizeof(float) ,cudaMemcpyDeviceToHost));
+	printf("This is the max val %f min val %f from CUDA \n",  max_logLum, min_logLum); 
+	
+	//step 2 calculate the range 
+	float range = max_logLum - min_logLum; 
+
+	//step 3: generate the historgram 
+	int * d_histo;
+	int * h_histo = new int[numBins];
+	checkCudaErrors(cudaMalloc(&d_histo, sizeof(int) * numBins));
+	checkCudaErrors(cudaMemset(d_histo,0 ,sizeof(int) * numBins));
+	thread_num = 1024; 
+	block_num = (numCols*numRows) / thread_num;
+	generate_histogram <<<thread_num, block_num >>>(d_logLuminance,d_histo, numBins, range, min_logLum );
+	checkCudaErrors(cudaMemcpy(h_histo, d_histo, sizeof(int) * numBins, cudaMemcpyDeviceToHost));
+
+	//step 4: perform an exclusive scan of the histogram to obtain the cdf
+
   //TODO
   /*Here are the steps you need to implement
     1) find the minimum and maximum value in the input logLuminance channel
