@@ -125,12 +125,44 @@ void parallel_minmax(const float* const d_in, float * min_d_out, float * max_d_o
 			max_d_out[blockIdx.x] = max_sdata[tid];
 	}
 }
+__global__ 
+void scan(float *d_out, float *d_in, int size) {
+	extern __shared__ float shared[]; 
+	int tid = threadIdx.x; 
+	int pout = 0, pin = 1;
+
+	shared[size*pout + tid] = (tid == 0) ? 0 : d_in[tid - 1]; 
+	__syncthreads(); 
+	//int val; 
+	for (int offset = 1; offset <= size; offset <<= 1) {
+		pout = !pout; 
+		pin = !pin; 
+		shared[pout*size + tid] = shared[pin*size + tid];
+		if (tid - offset >= 0) {
+			shared[pout*size + tid] += shared[pin*size + tid - offset];
+		} 
+		
+
+		/*if (tid - offset >= 0)
+			val = d_out[tid - offset];
+		__syncthreads(); 
+		if (tid - offset >= 0)
+			d_out[tid - offset] += val;*/
+		__syncthreads();
+	}
+
+	d_out[tid] = shared[pout*size + tid];
+}
 __global__
 void generate_histogram(const float* const d_logLuminance, int * d_histo, const int numOfBins, const float range, const float min) {
 	//extern __shared__ float shared_array[];
 	int id = threadIdx.x + blockDim.x * blockIdx.x; 
 	int bin = (d_logLuminance[id] - min) * (numOfBins) / range; 
 	atomicAdd(&(d_histo[bin]), 1);
+}
+__global__
+void set(float * dst) {
+	dst[threadIdx.x] = 1;
 }
 __global__ 
 void copy(float * dst, const float * const src) {
@@ -216,7 +248,17 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
 	block_num = (numCols*numRows) / thread_num;
 	generate_histogram <<<thread_num, block_num >>>(d_logLuminance,d_histo, numBins, range, min_logLum );
 	checkCudaErrors(cudaMemcpy(h_histo, d_histo, sizeof(int) * numBins, cudaMemcpyDeviceToHost));
-
+	float * h_out = new float[8];
+	float * d_out = new float[8];
+	float * d_test = new float[8]; 
+	checkCudaErrors(cudaMalloc(&d_test, sizeof(float)*8 ));
+	checkCudaErrors(cudaMalloc(&d_out, sizeof(float) * 8));
+	set << <1, 8 >> >(d_test);
+	scan << <1, 8, 8 * sizeof(float) * 2 >> >(d_out, d_test, 8); 
+	checkCudaErrors(cudaMemcpy(h_out, d_out, sizeof(float) * 8, cudaMemcpyDeviceToHost)); 
+	for (int i = 0; i < 8; i++) {
+		printf("%f \n", h_out[i]);
+	}
 	//step 4: perform an exclusive scan of the histogram to obtain the cdf
 
   //TODO
