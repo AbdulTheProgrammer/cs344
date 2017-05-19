@@ -125,9 +125,46 @@ void parallel_minmax(const float* const d_in, float * min_d_out, float * max_d_o
 			max_d_out[blockIdx.x] = max_sdata[tid];
 	}
 }
+__global__
+void scan_large(unsigned int *d_out, unsigned int *d_in, unsigned int * d_aux,  unsigned int size) {
+	extern __shared__ int shared[];
+	
+	int myId = threadIdx.x + blockDim.x * blockIdx.x;
+	int tid = threadIdx.x; 
+	int pout = 0, pin = 1;
+
+	shared[blockDim.x*pout + tid] = (tid == 0) ? 0 : d_in[myId - 1];
+	if (tid == blockDim.x - 1) {
+		d_aux[blockIdx.x] = d_in[myId]; 
+	}
+	__syncthreads();
+
+	for (int offset = 1; offset <= blockDim.x; offset <<= 1) {
+		pout = !pout;
+		pin = !pin;
+		shared[pout*blockDim.x + tid] = shared[pin*blockDim.x + tid];
+		if (tid - offset >= 0) {
+			shared[pout*blockDim.x + tid] += shared[pin*blockDim.x + tid - offset];
+		}
+
+		__syncthreads();
+	}
+
+	d_out[myId] = shared[pout*blockDim.x + tid];
+	if (tid == blockDim.x - 1) {
+		d_aux[blockIdx.x] += shared[pout*blockDim.x + tid];
+	}
+}
+
 __global__ 
-void scan(float *d_out, float *d_in, int size) {
-	extern __shared__ float shared[]; 
+void add_all(unsigned int *d_aux, unsigned int *d_out) {
+	int myId = threadIdx.x + blockDim.x * blockIdx.x; 
+	d_out[myId] += d_aux[blockIdx.x]; 
+}
+
+__global__ 
+void scan(unsigned *d_out, unsigned *d_in, int size) {
+	extern __shared__ int shared[]; 
 	int tid = threadIdx.x; 
 	int pout = 0, pin = 1;
 
@@ -154,7 +191,7 @@ void scan(float *d_out, float *d_in, int size) {
 	d_out[tid] = shared[pout*size + tid];
 }
 __global__
-void generate_histogram(const float* const d_logLuminance, int * d_histo, const int numOfBins, const float range, const float min) {
+void generate_histogram(const float* const d_logLuminance, unsigned * d_histo, const int numOfBins, const float range, const float min) {
 	//extern __shared__ float shared_array[];
 	int id = threadIdx.x + blockDim.x * blockIdx.x; 
 	int bin = (d_logLuminance[id] - min) * (numOfBins) / range; 
@@ -240,25 +277,26 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
 	float range = max_logLum - min_logLum; 
 
 	//step 3: generate the historgram 
-	int * d_histo;
-	int * h_histo = new int[numBins];
+	unsigned * d_histo;
+	unsigned * h_histo = new unsigned[numBins];
 	checkCudaErrors(cudaMalloc(&d_histo, sizeof(int) * numBins));
 	checkCudaErrors(cudaMemset(d_histo,0 ,sizeof(int) * numBins));
 	thread_num = 1024; 
 	block_num = (numCols*numRows) / thread_num;
 	generate_histogram <<<thread_num, block_num >>>(d_logLuminance,d_histo, numBins, range, min_logLum );
-	checkCudaErrors(cudaMemcpy(h_histo, d_histo, sizeof(int) * numBins, cudaMemcpyDeviceToHost));
-	float * h_out = new float[8];
-	float * d_out = new float[8];
-	float * d_test = new float[8]; 
-	checkCudaErrors(cudaMalloc(&d_test, sizeof(float)*8 ));
-	checkCudaErrors(cudaMalloc(&d_out, sizeof(float) * 8));
-	set << <1, 8 >> >(d_test);
-	scan << <1, 8, 8 * sizeof(float) * 2 >> >(d_out, d_test, 8); 
-	checkCudaErrors(cudaMemcpy(h_out, d_out, sizeof(float) * 8, cudaMemcpyDeviceToHost)); 
-	for (int i = 0; i < 8; i++) {
-		printf("%f \n", h_out[i]);
-	}
+	thread_num = 32;
+	block_num = numBins / 32;
+	unsigned * d_aux; 
+	// step 4: generate CDF 
+	checkCudaErrors(cudaMalloc(&d_aux, sizeof(int) * block_num)); 
+	scan_large << <block_num, thread_num, block_num * sizeof(int) * 2 >> >(d_cdf, d_histo, d_aux,  numBins); 
+	scan << <1, block_num, block_num * sizeof(int) * 2 >> >(d_aux, d_aux, block_num);
+	add_all << <block_num, thread_num >> >(d_aux, d_cdf);
+	unsigned * h_cdf = new unsigned[numBins];
+	checkCudaErrors(cudaMemcpy(h_cdf, d_cdf, sizeof(int) * numBins, cudaMemcpyDeviceToHost)); 
+	/*for (int i = 0; i < numBins; i++) {
+		printf("%u \n", h_cdf[i]);
+	}*/
 	//step 4: perform an exclusive scan of the histogram to obtain the cdf
 
   //TODO
